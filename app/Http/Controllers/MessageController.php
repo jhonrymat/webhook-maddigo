@@ -89,7 +89,7 @@ class MessageController extends Controller
                 if (empty($exists->id)) {
 
                     // Verificar si el contacto existe
-                    $contacto = Contacto::where('telefono', $value['messages'][0]['from'])->first();
+                    $contacto = Contacto::where('telefono', $value['contacts'][0]['profile']['wa_id'])->first();
                     // Si no existe, crearlo
                     if (!$contacto) {
                         $contacto = Contacto::createWithDefaultTag([
