@@ -135,7 +135,7 @@ class MessageController extends Controller
 
                         if (!is_null($file)) {
                             $message = $this->_saveMessage(
-                                env('APP_URL') . '/storage/' . $file,
+                                env('APP_URL_MG') . '/storage/' . $file,
                                 $mediaType,
                                 $value['messages'][0]['from'],
                                 $value['messages'][0]['id'],
