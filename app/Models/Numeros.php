@@ -13,7 +13,16 @@ class Numeros extends Model
         'nombre',
         'numero',
         'id_telefono',
-        'aplicacion',
+        'aplicacion_id',
         'calidad',
     ];
+
+    /**
+     * Obtener la aplicación asociada con el número.
+     */
+    public function aplicacion()
+    {
+        return $this->belongsTo(Aplicaciones::class, 'aplicacion_id');
+    }
+
 }

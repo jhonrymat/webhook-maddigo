@@ -2,19 +2,20 @@
 
 namespace App\Http\Controllers;
 
+use Exception;
+use Carbon\Carbon;
 use App\Events\Webhook;
-use App\Jobs\SendMessage;
-use App\Libraries\Whatsapp;
 use App\Models\Message;
 use App\Models\Numeros;
+use App\Models\Contacto;
+use PhpParser\Node\Expr;
+use App\Jobs\SendMessage;
+use App\Libraries\Whatsapp;
 use App\Models\Aplicaciones;
-use Carbon\Carbon;
-use Exception;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Http;
-use PhpParser\Node\Expr;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Http;
 
 
 class MessageController extends Controller
@@ -41,7 +42,7 @@ class MessageController extends Controller
         } catch (Exception $e) {
             Log::error('Error al obtener mensajes5: ' . $e->getMessage());
             return response()->json([
-                'success'  => false,
+                'success' => false,
                 'error' => $e->getMessage(),
             ], 500);
         }
@@ -67,25 +68,39 @@ class MessageController extends Controller
                 }
                 // Si el estado es 'failed', procesar y registrar los detalles del error
                 if ($status == 'failed') {
-                        $errorMessage = $value['statuses'][0]['errors'][0]['message'] ?? 'Unknown error';
-                        $errorCode = $value['statuses'][0]['errors'][0]['code'] ?? 'Unknown code';
-                        $errorDetails = $value['statuses'][0]['errors'][0]['error_data']['details'] ?? 'No additional details';
+                    $errorMessage = $value['statuses'][0]['errors'][0]['message'] ?? 'Unknown error';
+                    $errorCode = $value['statuses'][0]['errors'][0]['code'] ?? 'Unknown code';
+                    $errorDetails = $value['statuses'][0]['errors'][0]['error_data']['details'] ?? 'No additional details';
 
-                        // Registrar el error en los logs de Laravel
-                        Log::error("Webhook processing error: {$errorMessage}, Code: {$errorCode}, Details: {$errorDetails}");
+                    // Registrar el error en los logs de Laravel
+                    Log::error("Webhook processing error: {$errorMessage}, Code: {$errorCode}, Details: {$errorDetails}");
 
-                        // Aquí podrías agregar lógica adicional si necesitas manejar estos errores de manera específica
-                        // Por ejemplo, notificar al equipo de soporte, realizar reintento condicional, etc.
-                        if (!empty($wam->id)) {
-                            $wam->caption = $errorCode;
-                            $wam->save();
-                            Webhook::dispatch($wam, true);
-                        }
+                    // Aquí podrías agregar lógica adicional si necesitas manejar estos errores de manera específica
+                    // Por ejemplo, notificar al equipo de soporte, realizar reintento condicional, etc.
+                    if (!empty($wam->id)) {
+                        $wam->caption = $errorCode;
+                        $wam->save();
+                        Webhook::dispatch($wam, true);
+                    }
                 }
             } else if (!empty($value['messages'])) { // Message
                 $exists = Message::where('wam_id', $value['messages'][0]['id'])->first();
 
                 if (empty($exists->id)) {
+
+                    // Verificar si el contacto existe
+                    $contacto = Contacto::where('telefono', $value['messages'][0]['from'])->first();
+                    // Si no existe, crearlo
+                    if (!$contacto) {
+                        $contacto = Contacto::createWithDefaultTag([
+                            'nombre' => $value['contacts'][0]['profile']['name'],  // Asumiendo que no sabemos el nombre
+                            'telefono' => $value['contacts'][0]['profile']['wa_id'],
+                            'notas' => 'Contacto creado automáticamente por webhook'
+                        ]);
+                    }else if ($contacto->nombre == $contacto->telefono){
+                        $contacto->nombre = $value['contacts'][0]['profile']['name'];
+                        $contacto->save();
+                    }
                     $mediaSupported = ['audio', 'document', 'image', 'video', 'sticker'];
 
                     if ($value['messages'][0]['type'] == 'text') {
@@ -106,7 +121,7 @@ class MessageController extends Controller
                         //consulta para traer token
                         $num = Numeros::where('id_telefono', $value['metadata']['phone_number_id'])->first();
 
-                        $app = Aplicaciones::where('id', $num->aplicacion)->first();
+                        $app = Aplicaciones::where('id', $num->aplicacion_id)->first();
 
                         $tk = $app->token_api;
 
@@ -146,7 +161,6 @@ class MessageController extends Controller
                     }
                 }
             }
-
             return response()->json([
                 'success' => true,
                 'data' => $body,
