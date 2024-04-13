@@ -84,26 +84,28 @@ class MessageController extends Controller
                     }
                 }
             } else if (!empty($value['messages'])) { // Message
-                $exists = Message::where('wam_id', $value['messages'][0]['id'])->first();
+                // Verificar si el contacto existe
+                $contacto = Contacto::where('telefono', $value['contacts'][0]['wa_id'])->first();
+                // Si no existe, crearlo
+                if (!$contacto) {
+                    $contacto = new Contacto();
+                    $contacto->telefono = $value['contacts'][0]['wa_id'];
+                    $contacto->nombre = $value['contacts'][0]['profile']['name'];
+                    $contacto->notas = "Contacto creado por webhook";
+                    $contacto->save();
 
+                    // Asociar los tags seleccionados al nuevo contacto
+                    $contacto->tags()->attach(22);
+
+                } else if ($contacto->nombre == $contacto->telefono) {
+                    $contacto->nombre = $value['contacts'][0]['profile']['name'];
+                    $contacto->notas = "Nombre actualizado por webhook";
+                    $contacto->save();
+                }
+
+                $exists = Message::where('wam_id', $value['messages'][0]['id'])->first();
                 if (empty($exists->id)) {
 
-                    // Verificar si el contacto existe
-                    $contacto = Contacto::where('telefono', $value['contacts'][0]['profile']['wa_id'])->first();
-                    // Si no existe, crearlo
-                    if (!$contacto) {
-                        $contacto = new Contacto();
-                        $contacto->telefono = $value['contacts'][0]['profile']['wa_id'];
-                        $contacto->nombre = $value['contacts'][0]['profile']['name'];
-                        $contacto->notas = "Contacto creado automáticamente por webhook";
-                        $contacto->save();
-
-                        // Asociar los tags seleccionados al nuevo contacto
-                        $contacto->tags()->attach(22);
-                    } else if ($contacto->nombre == $contacto->telefono) {
-                        $contacto->nombre = $value['contacts'][0]['profile']['name'];
-                        $contacto->save();
-                    }
                     $mediaSupported = ['audio', 'document', 'image', 'video', 'sticker'];
 
                     if ($value['messages'][0]['type'] == 'text') {
