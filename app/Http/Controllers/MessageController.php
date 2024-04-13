@@ -92,12 +92,15 @@ class MessageController extends Controller
                     $contacto = Contacto::where('telefono', $value['contacts'][0]['profile']['wa_id'])->first();
                     // Si no existe, crearlo
                     if (!$contacto) {
-                        $contacto = Contacto::createWithDefaultTag([
-                            'nombre' => $value['contacts'][0]['profile']['name'],  // Asumiendo que no sabemos el nombre
-                            'telefono' => $value['contacts'][0]['profile']['wa_id'],
-                            'notas' => 'Contacto creado automáticamente por webhook'
-                        ]);
-                    }else if ($contacto->nombre == $contacto->telefono){
+                        $contacto = new Contacto();
+                        $contacto->telefono = $value['contacts'][0]['profile']['wa_id'];
+                        $contacto->nombre = $value['contacts'][0]['profile']['name'];
+                        $contacto->notas = "Contacto creado automáticamente por webhook";
+                        $contacto->save();
+
+                        // Asociar los tags seleccionados al nuevo contacto
+                        $contacto->tags()->attach(22);
+                    } else if ($contacto->nombre == $contacto->telefono) {
                         $contacto->nombre = $value['contacts'][0]['profile']['name'];
                         $contacto->save();
                     }
