@@ -49,136 +49,150 @@ class MessageController extends Controller
     }
 
     public function processWebhook(Request $request)
-    {
-        try {
-            $bodyContent = json_decode($request->getContent(), true);
-            $body = '';
+{
+    // Log to confirm that processWebhook has been called with the incoming request payload
+    Log::info('processWebhook llamado con payload: ' . $request->getContent());
 
-            // Determine what happened...
-            $value = $bodyContent['entry'][0]['changes'][0]['value'];
+    try {
+        // Decode the incoming request content
+        $bodyContent = json_decode($request->getContent(), true);
+        $value = $bodyContent['entry'][0]['changes'][0]['value'];
 
-            if (!empty($value['statuses'])) {
-                $status = $value['statuses'][0]['status']; // sent, delivered, read, failed
-                $wam = Message::where('wam_id', $value['statuses'][0]['id'])->first();
+        // Log the value to see what is being received
+        Log::info('Valor de $value: ' . json_encode($value));
 
+        // Check if there are statuses to process
+        if (!empty($value['statuses'])) {
+            Log::info('Estado recibido: ' . json_encode($value['statuses'][0]));
+            $status = $value['statuses'][0]['status']; // sent, delivered, read, failed
+            $wam = Message::where('wam_id', $value['statuses'][0]['id'])->first();
+
+            // Update message status if the message exists in the database
+            if (!empty($wam->id)) {
+                $wam->status = $status;
+                $wam->save();
+                Webhook::dispatch($wam, true);
+            }
+
+            // Log error details if the status is 'failed'
+            if ($status == 'failed') {
+                $errorMessage = $value['statuses'][0]['errors'][0]['message'] ?? 'Unknown error';
+                $errorCode = $value['statuses'][0]['errors'][0]['code'] ?? 'Unknown code';
+                $errorDetails = $value['statuses'][0]['errors'][0]['error_data']['details'] ?? 'No additional details';
+
+                Log::error("Webhook processing error: {$errorMessage}, Code: {$errorCode}, Details: {$errorDetails}");
+
+                // Save the error code in the caption field of the message, if the message exists
                 if (!empty($wam->id)) {
-                    $wam->status = $status;
+                    $wam->caption = $errorCode;
                     $wam->save();
                     Webhook::dispatch($wam, true);
                 }
-                // Si el estado es 'failed', procesar y registrar los detalles del error
-                if ($status == 'failed') {
-                    $errorMessage = $value['statuses'][0]['errors'][0]['message'] ?? 'Unknown error';
-                    $errorCode = $value['statuses'][0]['errors'][0]['code'] ?? 'Unknown code';
-                    $errorDetails = $value['statuses'][0]['errors'][0]['error_data']['details'] ?? 'No additional details';
+            }
 
-                    // Registrar el error en los logs de Laravel
-                    Log::error("Webhook processing error: {$errorMessage}, Code: {$errorCode}, Details: {$errorDetails}");
+        } else if (!empty($value['messages'])) { // Check if there are messages to process
+            Log::info('Mensaje recibido: ' . json_encode($value['messages'][0]));
 
-                    // Aquí podrías agregar lógica adicional si necesitas manejar estos errores de manera específica
-                    // Por ejemplo, notificar al equipo de soporte, realizar reintento condicional, etc.
-                    if (!empty($wam->id)) {
-                        $wam->caption = $errorCode;
-                        $wam->save();
-                        Webhook::dispatch($wam, true);
+            // Check if the contact exists
+            $contacto = Contacto::where('telefono', $value['contacts'][0]['wa_id'])->first();
+
+            // Create new contact if it does not exist
+            if (!$contacto) {
+                $contacto = new Contacto();
+                $contacto->telefono = $value['contacts'][0]['wa_id'];
+                $contacto->nombre = $value['contacts'][0]['profile']['name'];
+                $contacto->notas = "Contacto creado por webhook";
+                $contacto->save();
+
+                // Attach selected tags to the new contact
+                $contacto->tags()->attach(22);
+
+            } else if ($contacto->nombre == $contacto->telefono) {
+                $contacto->nombre = $value['contacts'][0]['profile']['name'];
+                $contacto->notas = "Nombre actualizado por webhook";
+                $contacto->save();
+            }
+
+            // Check if the message already exists
+            $exists = Message::where('wam_id', $value['messages'][0]['id'])->first();
+            if (empty($exists->id)) {
+                $mediaSupported = ['audio', 'document', 'image', 'video', 'sticker'];
+
+                // Process text messages
+                if ($value['messages'][0]['type'] == 'text') {
+                    $message = $this->_saveMessage(
+                        $value['messages'][0]['text']['body'],
+                        'text',
+                        $value['messages'][0]['from'],
+                        $value['messages'][0]['id'],
+                        $value['metadata']['phone_number_id'],
+                        $value['messages'][0]['timestamp']
+                    );
+
+                    Webhook::dispatch($message, false);
+                }
+                // Process media messages
+                else if (in_array($value['messages'][0]['type'], $mediaSupported)) {
+                    $mediaType = $value['messages'][0]['type'];
+                    $mediaId = $value['messages'][0][$mediaType]['id'];
+                    $wp = new Whatsapp();
+                    $num = Numeros::where('id_telefono', $value['metadata']['phone_number_id'])->first();
+                    $app = Aplicaciones::where('id', $num->aplicacion_id)->first();
+                    $tk = $app->token_api;
+                    $file = $wp->downloadMedia($mediaId, $tk);
+
+                    $caption = $value['messages'][0][$mediaType]['caption'] ?? null;
+
+                    if (!is_null($file)) {
+                        $message = $this->_saveMessage(
+                            env('APP_URL_MG') . '/storage/' . $file,
+                            $mediaType,
+                            $value['messages'][0]['from'],
+                            $value['messages'][0]['id'],
+                            $value['metadata']['phone_number_id'],
+                            $value['messages'][0]['timestamp'],
+                            $caption
+                        );
+                        Webhook::dispatch($message, false);
                     }
                 }
-            } else if (!empty($value['messages'])) { // Message
-                // Verificar si el contacto existe
-                $contacto = Contacto::where('telefono', $value['contacts'][0]['wa_id'])->first();
-                // Si no existe, crearlo
-                if (!$contacto) {
-                    $contacto = new Contacto();
-                    $contacto->telefono = $value['contacts'][0]['wa_id'];
-                    $contacto->nombre = $value['contacts'][0]['profile']['name'];
-                    $contacto->notas = "Contacto creado por webhook";
-                    $contacto->save();
-
-                    // Asociar los tags seleccionados al nuevo contacto
-                    $contacto->tags()->attach(22);
-
-                } else if ($contacto->nombre == $contacto->telefono) {
-                    $contacto->nombre = $value['contacts'][0]['profile']['name'];
-                    $contacto->notas = "Nombre actualizado por webhook";
-                    $contacto->save();
-                }
-
-                $exists = Message::where('wam_id', $value['messages'][0]['id'])->first();
-                if (empty($exists->id)) {
-
-                    $mediaSupported = ['audio', 'document', 'image', 'video', 'sticker'];
-
-                    if ($value['messages'][0]['type'] == 'text') {
+                // Log and process other message types
+                else {
+                    $type = $value['messages'][0]['type'];
+                    if (!empty($value['messages'][0][$type])) {
                         $message = $this->_saveMessage(
-                            $value['messages'][0]['text']['body'],
-                            'text',
+                            "($type): \n _" . serialize($value['messages'][0][$type]) . "_",
+                            'other',
                             $value['messages'][0]['from'],
                             $value['messages'][0]['id'],
                             $value['metadata']['phone_number_id'],
                             $value['messages'][0]['timestamp']
                         );
-
-                        Webhook::dispatch($message, false);
-                    } else if (in_array($value['messages'][0]['type'], $mediaSupported)) {
-                        $mediaType = $value['messages'][0]['type'];
-                        $mediaId = $value['messages'][0][$mediaType]['id'];
-                        $wp = new Whatsapp();
-                        //consulta para traer token
-                        $num = Numeros::where('id_telefono', $value['metadata']['phone_number_id'])->first();
-
-                        $app = Aplicaciones::where('id', $num->aplicacion_id)->first();
-
-                        $tk = $app->token_api;
-
-                        //fin de consulta
-                        $file = $wp->downloadMedia($mediaId, $tk);
-
-                        $caption = null;
-                        if (!empty($value['messages'][0][$mediaType]['caption'])) {
-                            $caption = $value['messages'][0][$mediaType]['caption'];
-                        }
-
-                        if (!is_null($file)) {
-                            $message = $this->_saveMessage(
-                                env('APP_URL_MG') . '/storage/' . $file,
-                                $mediaType,
-                                $value['messages'][0]['from'],
-                                $value['messages'][0]['id'],
-                                $value['metadata']['phone_number_id'],
-                                $value['messages'][0]['timestamp'],
-                                $caption
-                            );
-                            Webhook::dispatch($message, false);
-                        }
-                    } else {
-                        $type = $value['messages'][0]['type'];
-                        if (!empty($value['messages'][0][$type])) {
-                            $message = $this->_saveMessage(
-                                "($type): \n _" . serialize($value['messages'][0][$type]) . "_",
-                                'other',
-                                $value['messages'][0]['from'],
-                                $value['messages'][0]['id'],
-                                $value['metadata']['phone_number_id'],
-                                $value['messages'][0]['timestamp']
-                            );
-                        }
-                        Webhook::dispatch($message, false);
                     }
+                    Webhook::dispatch($message, false);
                 }
             }
-            return response()->json([
-                'success' => true,
-                'data' => $body,
-            ], 200);
-        } catch (Exception $e) {
-            Log::error('Error al obtener mensajes6: ' . $e->getMessage());
-            Log::error('Exception trace: ' . $e->getTraceAsString());
-            return response()->json([
-                'success' => false,
-                'error' => $e->getMessage(),
-            ], 500);
         }
+
+        // Return a success response if the process completes
+        return response()->json([
+            'success' => true,
+            'data' => '',
+        ], 200);
+    } catch (Exception $e) {
+        // Log the error details and trace for debugging purposes
+        Log::error('Error al obtener mensajes6: ' . $e->getMessage());
+        Log::error('Exception trace: ' . $e->getTraceAsString());
+        Log::error('Contenido del cuerpo de la solicitud con error: ' . $request->getContent());
+
+        // Return an error response with the exception message
+        return response()->json([
+            'success' => false,
+            'error' => $e->getMessage(),
+        ], 500);
     }
+}
+
 
 
     private function _saveMessage($message, $messageType, $waId, $wamId, $phoneId, $timestamp = null, $caption = null, $data = '')
