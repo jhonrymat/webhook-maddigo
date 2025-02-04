@@ -1,13 +1,14 @@
 <?php
 
-use App\Http\Controllers\MessageController;
-use App\Http\Controllers\ContactoController;
-use App\Http\Controllers\AplicacionesController;
-use App\Http\Controllers\NumerosController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
-
 use Illuminate\Support\Facades\Artisan;
+use App\Http\Controllers\AwsSesController;
+use App\Http\Controllers\MessageController;
+use App\Http\Controllers\NumerosController;
+
+use App\Http\Controllers\ContactoController;
+use App\Http\Controllers\AplicacionesController;
 
 /*
 |--------------------------------------------------------------------------
@@ -20,7 +21,10 @@ use Illuminate\Support\Facades\Artisan;
 |
 */
 
-
+// whatsapp webhook
 Route::get('/whatsapp-webhook', [MessageController::class, 'verifyWebhook']);
 Route::post('/whatsapp-webhook', [MessageController::class, 'processWebhook']);
+
+// aws ses webhook
+Route::post('/aws-ses-webhook', [AwsSesController::class, 'handleNotification']);
 
