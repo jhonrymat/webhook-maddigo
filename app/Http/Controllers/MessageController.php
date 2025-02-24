@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use Exception;
 use Carbon\Carbon;
+use App\Models\Thread;
 use App\Events\Webhook;
 use App\Models\Message;
 use App\Models\Numeros;
@@ -13,11 +14,11 @@ use App\Jobs\SendMessage;
 use App\Libraries\Whatsapp;
 use App\Models\Aplicaciones;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Log;
 use App\Http\Controllers\BotIA;
-use App\Models\Thread;
+use Illuminate\Support\Facades\DB;
+use OpenAI\Laravel\Facades\OpenAI;
 
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Http;
 
 
@@ -115,7 +116,6 @@ class MessageController extends Controller
                     $contacto->notas = "Nombre actualizado por webhook";
                     $contacto->save();
                 }
-
                 // Check if the message already exists
                 $exists = Message::where('wam_id', $value['messages'][0]['id'])->first();
                 if (empty($exists->id)) {
@@ -152,7 +152,7 @@ class MessageController extends Controller
                             // Ahora tienes acceso a los datos del bot
                             if ($bot) {
                                 $botIA = new BotIA();
-                                $answer = $botIA->ask($messageBody, $userWaId, $bot->id,  $bot->openai_key, $bot->openai_org, $bot->openai_assistant );
+                                $answer = $botIA->ask($messageBody, $userWaId, $bot->id, $bot->openai_key, $bot->openai_org, $bot->openai_assistant);
                                 // Otros datos del bot que necesites...
                             } else {
                                 // Maneja el caso donde no hay un bot asociado
@@ -194,18 +194,72 @@ class MessageController extends Controller
                         $caption = $value['messages'][0][$mediaType]['caption'] ?? null;
 
                         if (!is_null($file)) {
-                            $message = $this->_saveMessage(
-                                env('APP_URL_MG') . '/storage/' . $file,
-                                $mediaType,
-                                $value['messages'][0]['from'],
-                                $value['messages'][0]['id'],
-                                $value['metadata']['phone_number_id'],
-                                $value['messages'][0]['timestamp'],
-                                $caption
-                            );
-                            Webhook::dispatch($message, false);
+                            // Si el archivo es un audio, procesar con OpenAI Whisper
+                            if ($mediaType == 'audio') {
+
+                                $message = $this->_saveMessage(
+                                    env('APP_URL_MG') . '/storage/' . $file,
+                                    $mediaType,
+                                    $value['messages'][0]['from'],
+                                    $value['messages'][0]['id'],
+                                    $value['metadata']['phone_number_id'],
+                                    $value['messages'][0]['timestamp'],
+                                    $caption
+                                );
+                                Webhook::dispatch($message, false);
+
+                                $bot = $app->bot->first();
+                                config(['openai.api_key' => $bot->openai_key]);
+                                config(['openai.organization' => $bot->openai_org]);
+
+                                $response = OpenAI::audio()->transcribe([
+                                    'model' => 'whisper-1',
+                                    'file' => fopen(storage_path('app/public/' . $file), 'r'),
+                                    'response_format' => 'verbose_json',
+                                    'timestamp_granularities' => ['segment', 'word']
+                                ]);
+
+                                $transcribedText = $response->text; // Transcripción del audio
+                                Log::info('Transcripción de audio: ' . $transcribedText);
+
+                                // Procesar la transcripción con el bot
+                                $botIA = new BotIA();
+                                $answer = $botIA->ask($transcribedText, $value['messages'][0]['from'], $bot->id, $bot->openai_key, $bot->openai_org, $bot->openai_assistant);
+
+                                // Enviar respuesta al usuario por WhatsApp
+                                $respuesta = new Whatsapp();
+                                $response = $respuesta->sendText($value['messages'][0]['from'], $answer, $num->id_telefono, $app->token_api);
+
+                                // Guardar mensaje enviado
+                                $message = new Message();
+                                $message->wa_id = $value['contacts'][0]['wa_id'];
+                                $message->wam_id = $response["messages"][0]["id"];
+                                $message->phone_id = $num->id_telefono;
+                                $message->type = 'text';
+                                $message->outgoing = true;
+                                $message->body = $answer;
+                                $message->status = 'sent';
+                                $message->caption = '';
+                                $message->data = '';
+                                $message->save();
+
+                                Webhook::dispatch($message, false);
+                            } else {
+                                // Si no es audio, procesar como archivo de medios normal
+                                $message = $this->_saveMessage(
+                                    env('APP_URL_MG') . '/storage/' . $file,
+                                    $mediaType,
+                                    $value['messages'][0]['from'],
+                                    $value['messages'][0]['id'],
+                                    $value['metadata']['phone_number_id'],
+                                    $value['messages'][0]['timestamp'],
+                                    $caption
+                                );
+                                Webhook::dispatch($message, false);
+                            }
                         }
                     }
+
                     // Log and process other message types
                     else {
                         $type = $value['messages'][0]['type'];
