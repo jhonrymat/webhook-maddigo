@@ -54,20 +54,13 @@ class MessageController extends Controller
 
     public function processWebhook(Request $request)
     {
-        // Log to confirm that processWebhook has been called with the incoming request payload
-        Log::info('processWebhook llamado con payload: ' . $request->getContent());
-
         try {
             // Decode the incoming request content
             $bodyContent = json_decode($request->getContent(), true);
             $value = $bodyContent['entry'][0]['changes'][0]['value'];
 
-            // Log the value to see what is being received
-            Log::info('Valor de $value: ' . json_encode($value));
-
             // Check if there are statuses to process
             if (!empty($value['statuses'])) {
-                Log::info('Estado recibido: ' . json_encode($value['statuses'][0]));
                 $status = $value['statuses'][0]['status']; // sent, delivered, read, failed
                 $wam = Message::where('wam_id', $value['statuses'][0]['id'])->first();
 
@@ -95,7 +88,6 @@ class MessageController extends Controller
                 }
 
             } else if (!empty($value['messages'])) { // Check if there are messages to process
-                Log::info('Mensaje recibido: ' . json_encode($value['messages'][0]));
 
                 // Check if the contact exists
                 $contacto = Contacto::where('telefono', $value['contacts'][0]['wa_id'])->first();
@@ -194,24 +186,27 @@ class MessageController extends Controller
                         $caption = $value['messages'][0][$mediaType]['caption'] ?? null;
 
                         if (!is_null($file)) {
-                            // Si el archivo es un audio, procesar con OpenAI Whisper
+                            // Guardar el audio recibido con el link
+                            $audioMessage = new Message();
+                            $audioMessage->wa_id = $value['contacts'][0]['wa_id'];
+                            $audioMessage->wam_id = $value['messages'][0]['id'];
+                            $audioMessage->phone_id = $num->id_telefono;
+                            $audioMessage->type = $mediaType; // Puede ser audio, documento, imagen, etc.
+                            $audioMessage->outgoing = false;
+                            $audioMessage->body = env('APP_URL_MG') . '/storage/' . $file; // Guardar solo el enlace del archivo
+                            $audioMessage->status = 'received';
+                            $audioMessage->caption = $caption ?? '';
+                            $audioMessage->data = '';
+                            $audioMessage->save();
+
+                            Webhook::dispatch($audioMessage, false);
+
                             if ($mediaType == 'audio') {
-
-                                $message = $this->_saveMessage(
-                                    env('APP_URL_MG') . '/storage/' . $file,
-                                    $mediaType,
-                                    $value['messages'][0]['from'],
-                                    $value['messages'][0]['id'],
-                                    $value['metadata']['phone_number_id'],
-                                    $value['messages'][0]['timestamp'],
-                                    $caption
-                                );
-                                Webhook::dispatch($message, false);
-
                                 $bot = $app->bot->first();
                                 config(['openai.api_key' => $bot->openai_key]);
                                 config(['openai.organization' => $bot->openai_org]);
 
+                                // Transcripción de audio con Whisper (solo para generar respuesta)
                                 $response = OpenAI::audio()->transcribe([
                                     'model' => 'whisper-1',
                                     'file' => fopen(storage_path('app/public/' . $file), 'r'),
@@ -219,8 +214,7 @@ class MessageController extends Controller
                                     'timestamp_granularities' => ['segment', 'word']
                                 ]);
 
-                                $transcribedText = $response->text; // Transcripción del audio
-                                Log::info('Transcripción de audio: ' . $transcribedText);
+                                $transcribedText = $response->text;
 
                                 // Procesar la transcripción con el bot
                                 $botIA = new BotIA();
@@ -230,32 +224,20 @@ class MessageController extends Controller
                                 $respuesta = new Whatsapp();
                                 $response = $respuesta->sendText($value['messages'][0]['from'], $answer, $num->id_telefono, $app->token_api);
 
-                                // Guardar mensaje enviado
-                                $message = new Message();
-                                $message->wa_id = $value['contacts'][0]['wa_id'];
-                                $message->wam_id = $response["messages"][0]["id"];
-                                $message->phone_id = $num->id_telefono;
-                                $message->type = 'text';
-                                $message->outgoing = true;
-                                $message->body = $answer;
-                                $message->status = 'sent';
-                                $message->caption = '';
-                                $message->data = '';
-                                $message->save();
+                                // Guardar solo el mensaje de respuesta
+                                $reply = new Message();
+                                $reply->wa_id = $value['contacts'][0]['wa_id'];
+                                $reply->wam_id = $response["messages"][0]["id"];
+                                $reply->phone_id = $num->id_telefono;
+                                $reply->type = 'text';
+                                $reply->outgoing = true;
+                                $reply->body = $answer;
+                                $reply->status = 'sent';
+                                $reply->caption = '';
+                                $reply->data = '';
+                                $reply->save();
 
-                                Webhook::dispatch($message, false);
-                            } else {
-                                // Si no es audio, procesar como archivo de medios normal
-                                $message = $this->_saveMessage(
-                                    env('APP_URL_MG') . '/storage/' . $file,
-                                    $mediaType,
-                                    $value['messages'][0]['from'],
-                                    $value['messages'][0]['id'],
-                                    $value['metadata']['phone_number_id'],
-                                    $value['messages'][0]['timestamp'],
-                                    $caption
-                                );
-                                Webhook::dispatch($message, false);
+                                Webhook::dispatch($reply, false);
                             }
                         }
                     }
