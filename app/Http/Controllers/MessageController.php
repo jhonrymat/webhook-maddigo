@@ -144,7 +144,7 @@ class MessageController extends Controller
                             // Ahora tienes acceso a los datos del bot
                             if ($bot) {
                                 $botIA = new BotIA();
-                                $answer = $botIA->ask($messageBody, $userWaId, $bot->id, $bot->openai_key, $bot->openai_org, $bot->openai_assistant);
+                                $answer = $botIA->ask($messageBody, $userWaId, $bot->id, $bot->openai_key, $bot->openai_org, $bot->openai_assistant, $imagenurl = "");
                                 // Otros datos del bot que necesites...
                             } else {
                                 // Maneja el caso donde no hay un bot asociado
@@ -218,7 +218,7 @@ class MessageController extends Controller
 
                                 // Procesar la transcripción con el bot
                                 $botIA = new BotIA();
-                                $answer = $botIA->ask($transcribedText, $value['messages'][0]['from'], $bot->id, $bot->openai_key, $bot->openai_org, $bot->openai_assistant);
+                                $answer = $botIA->ask($transcribedText, $value['messages'][0]['from'], $bot->id, $bot->openai_key, $bot->openai_org, $bot->openai_assistant, $imagenurl = "");
 
                                 // Enviar respuesta al usuario por WhatsApp
                                 $respuesta = new Whatsapp();
@@ -238,6 +238,90 @@ class MessageController extends Controller
                                 $reply->save();
 
                                 Webhook::dispatch($reply, false);
+                            }
+                            if ($mediaType == 'image') {
+
+                                Log::info('📸 Procesando imagen recibida en WhatsApp.');
+
+                                $bot = $app->bot->first();
+                                if (!$bot) {
+                                    Log::error('❌ No se encontró un bot asociado al app.');
+                                    return;
+                                }
+
+                                config(['openai.api_key' => $bot->openai_key]);
+                                config(['openai.organization' => $bot->openai_org]);
+
+                                //si $caption esta vacio o null
+                                $botIA = new BotIA();
+                                $imagenurl = env('APP_URL_MG') . '/storage/' . $file;
+
+                                Log::info('🌐 URL de la imagen generada: ' . $imagenurl);
+
+                                if (!file_exists(storage_path('app/public/' . $file))) {
+                                    Log::error('❌ La imagen no existe en el almacenamiento: ' . storage_path('app/public/' . $file));
+                                    return;
+                                }
+
+                                $waId = $value['messages'][0]['from'] ?? null;
+                                if (!$waId) {
+                                    Log::error('❌ No se encontró el identificador del remitente en WhatsApp.');
+                                    return;
+                                }
+
+                                if ($caption == null) {
+                                    Log::info('📝 No se encontró caption. Usando mensaje predeterminado.');
+                                    $caption = "Revisa la imagen y responde acorde a la charla";
+                                }
+
+                                // Enviar mensaje a OpenAI
+                                Log::info('💬 Enviando a OpenAI -> Caption: ' . $caption);
+
+                                try {
+                                    $answer = $botIA->ask($caption, $waId, $bot->id, $bot->openai_key, $bot->openai_org, $bot->openai_assistant, $imagenurl);
+                                    Log::info('✅ Respuesta de OpenAI: ' . $answer);
+                                } catch (Exception $e) {
+                                    Log::error('❌ Error al procesar con OpenAI: ' . $e->getMessage());
+                                    return;
+                                }
+
+                                // Enviar respuesta al usuario por WhatsApp
+                                $respuesta = new Whatsapp();
+
+                                try {
+                                    Log::info('📤 Enviando respuesta a WhatsApp...');
+                                    $response = $respuesta->sendText($waId, $answer, $num->id_telefono, $app->token_api);
+                                    Log::info('✅ Respuesta enviada con éxito. ID de mensaje: ' . $response["messages"][0]["id"]);
+                                } catch (Exception $e) {
+                                    Log::error('❌ Error al enviar respuesta a WhatsApp: ' . $e->getMessage());
+                                    return;
+                                }
+
+
+                                // Guardar solo el mensaje de respuesta en la base de datos
+                                try {
+                                    Log::info('💾 Guardando mensaje en la base de datos...');
+                                    $reply = new Message();
+                                    $reply->wa_id = $value['contacts'][0]['wa_id'];
+                                    $reply->wam_id = $response["messages"][0]["id"];
+                                    $reply->phone_id = $num->id_telefono;
+                                    $reply->type = 'text';
+                                    $reply->outgoing = true;
+                                    $reply->body = $answer;
+                                    $reply->status = 'sent';
+                                    $reply->caption = '';
+                                    $reply->data = '';
+                                    $reply->save();
+                                    Log::info('✅ Mensaje guardado exitosamente en la base de datos.');
+                                } catch (Exception $e) {
+                                    Log::error('❌ Error al guardar el mensaje en la base de datos: ' . $e->getMessage());
+                                    return;
+                                }
+
+                                // Despachar webhook
+                                Log::info('🚀 Despachando webhook...');
+                                Webhook::dispatch($reply, false);
+                                Log::info('✅ Webhook despachado correctamente.');
                             }
                         }
                     }
