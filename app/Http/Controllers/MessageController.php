@@ -172,6 +172,9 @@ class MessageController extends Controller
 
 
                         Webhook::dispatch($message, false);
+                        // 🔥 Marcar contacto con mensaje nuevo
+                        $contacto->tiene_mensajes_nuevos = true;
+                        $contacto->save();
                     }
                     // Process media messages
                     else if (in_array($value['messages'][0]['type'], $mediaSupported)) {
@@ -340,6 +343,9 @@ class MessageController extends Controller
                             );
                         }
                         Webhook::dispatch($message, false);
+                        // 🔥 Marcar contacto con mensaje nuevo
+                        $contacto->tiene_mensajes_nuevos = true;
+                        $contacto->save();
                     }
                 }
             }

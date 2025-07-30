@@ -65,8 +65,10 @@ class BotIA extends Controller
                 $runStatusResponse = OpenAI::threads()->runs()->list($thread->thread_id);
 
                 // Verificamos si hay algún "run" en progreso
-                $runData = collect($runStatusResponse->data)->first(); // Tomamos el más reciente
-                Log::info( "estado" . $runData->status );
+                $runData = collect($runStatusResponse->data)
+                    ->sortByDesc('created_at')
+                    ->first();
+                Log::info("estado" . $runData->status);
 
                 if ($runData && $runData->status === 'in_progress') {
                     Log::info('🕒 Run en progreso. Notificando al usuario que espere.');

@@ -14,7 +14,8 @@ class Contacto extends Model
         'apellido',
         'correo',
         'telefono',
-        'notas'
+        'notas',
+        'tiene_mensajes_nuevos',
     ];
 
     public function tags()
