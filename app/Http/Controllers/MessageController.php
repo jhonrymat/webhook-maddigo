@@ -203,6 +203,9 @@ class MessageController extends Controller
                             $audioMessage->save();
 
                             Webhook::dispatch($audioMessage, false);
+                            // 🔥 Marcar contacto con mensaje nuevo
+                            $contacto->tiene_mensajes_nuevos = true;
+                            $contacto->save();
 
                             if ($mediaType == 'audio') {
                                 $bot = $app->bot->first();
