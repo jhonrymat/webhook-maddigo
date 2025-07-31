@@ -388,7 +388,7 @@ class MessageController extends Controller
         }
         $wam->save();
 
-        Webhook::dispatch($message, false);
+        Webhook::dispatch($wam, false);
         Log::info('mensaje enviado por el usuario: ' . $wam->body);
         // encontrar el contacto relacionado
         $contacto = Contacto::where('telefono', $waId)->first();
