@@ -162,13 +162,14 @@ class MessageController extends Controller
                         $message->wa_id = $value['contacts'][0]['wa_id'];
                         $message->wam_id = $response["messages"][0]["id"];
                         $message->phone_id = $num->id_telefono;
-                        $message->type = 'text';
+                        $message->type = 'ia';
                         $message->outgoing = true;
                         $message->body = $answer;
                         $message->status = 'sent';
                         $message->caption = '';
                         $message->data = '';
                         $message->save();
+                        //Log::info('Mensaje de la ia: ' . $message->body);
 
 
                         Webhook::dispatch($message, false);
@@ -316,15 +317,12 @@ class MessageController extends Controller
                                     $reply->data = '';
                                     $reply->save();
                                     Log::info('✅ Mensaje guardado exitosamente en la base de datos.');
+                                    Webhook::dispatch($reply, false);
                                 } catch (Exception $e) {
                                     Log::error('❌ Error al guardar el mensaje en la base de datos: ' . $e->getMessage());
                                     return;
                                 }
 
-                                // Despachar webhook
-                                Log::info('🚀 Despachando webhook...');
-                                Webhook::dispatch($reply, false);
-                                Log::info('✅ Webhook despachado correctamente.');
                             }
                         }
                     }
@@ -341,11 +339,11 @@ class MessageController extends Controller
                                 $value['metadata']['phone_number_id'],
                                 $value['messages'][0]['timestamp']
                             );
+                            Webhook::dispatch($message, false);
+                            // 🔥 Marcar contacto con mensaje nuevo
+                            $contacto->tiene_mensajes_nuevos = true;
+                            $contacto->save();
                         }
-                        Webhook::dispatch($message, false);
-                        // 🔥 Marcar contacto con mensaje nuevo
-                        $contacto->tiene_mensajes_nuevos = true;
-                        $contacto->save();
                     }
                 }
             }
@@ -389,6 +387,14 @@ class MessageController extends Controller
             $wam->updated_at = Carbon::createFromTimestamp($timestamp)->toDateTimeString();
         }
         $wam->save();
+
+        Webhook::dispatch($message, false);
+        Log::info('mensaje enviado por el usuario: ' . $wam->body);
+        // encontrar el contacto relacionado
+        $contacto = Contacto::where('telefono', $waId)->first();
+        // 🔥 Marcar contacto con mensaje nuevo
+        $contacto->tiene_mensajes_nuevos = true;
+        $contacto->save();
 
         return $wam;
     }

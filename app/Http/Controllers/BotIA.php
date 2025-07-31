@@ -24,7 +24,7 @@ class BotIA extends Controller
     // Método para manejar preguntas
     public function ask($question, $waId, $botId, $openai_key, $openai_org, $openai_assistant, $imageUrl)
     {
-        Log::info('Pregunta: ' . $question . ', Imagen: ' . $imageUrl . ', Bot ID: ' . $botId . ', Usuario: ' . $waId);
+        //Log::info('Pregunta: ' . $question . ', Imagen: ' . $imageUrl . ', Bot ID: ' . $botId . ', Usuario: ' . $waId);
         $this->question = $question;
         $bandera = true;
 
@@ -108,7 +108,7 @@ class BotIA extends Controller
             return $this->processImageAndText($imageUrl, $question, $botId, $bot->openai_key, $bot->openai_org, $bot->openai_assistant, $waId, $thread->thread_id);
 
         } elseif (!empty($question)) {
-            Log::info('Procesando solo texto...');
+            //Log::info('Procesando solo texto...');
 
             if ($bandera) {
                 $threadRun = $this->continueThread($thread->thread_id, $openai_key, $openai_org, $openai_assistant);
