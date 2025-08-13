@@ -20,6 +20,8 @@ use OpenAI\Laravel\Facades\OpenAI;
 
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Validation\Rule;
+use Illuminate\Support\Facades\Validator;
 
 
 class MessageController extends Controller
@@ -55,349 +57,439 @@ class MessageController extends Controller
     public function processWebhook(Request $request)
     {
         try {
-            // Decode the incoming request content
-            $bodyContent = json_decode($request->getContent(), true);
-            $value = $bodyContent['entry'][0]['changes'][0]['value'];
+            // A) Parseo seguro
+            $body = json_decode($request->getContent(), true) ?? [];
+            $value = data_get($body, 'entry.0.changes.0.value', []);
 
-            // Check if there are statuses to process
-            if (!empty($value['statuses'])) {
-                $status = $value['statuses'][0]['status']; // sent, delivered, read, failed
-                $wam = Message::where('wam_id', $value['statuses'][0]['id'])->first();
+            // B) Actualización de estatus (sent|delivered|read|failed)
+            if (!empty(data_get($value, 'statuses'))) {
+                $statusItem = data_get($value, 'statuses.0', []);
+                $status = data_get($statusItem, 'status');
+                $statusWamId = data_get($statusItem, 'id');
 
-                // Update message status if the message exists in the database
-                if (!empty($wam->id)) {
-                    $wam->status = $status;
-                    $wam->save();
-                    Webhook::dispatch($wam, true);
-                }
+                if ($statusWamId) {
+                    $wam = Message::where('wam_id', $statusWamId)->first();
+                    if ($wam) {
+                        $wam->status = $status ?? $wam->status;
 
-                // Log error details if the status is 'failed'
-                if ($status == 'failed') {
-                    $errorMessage = $value['statuses'][0]['errors'][0]['message'] ?? 'Unknown error';
-                    $errorCode = $value['statuses'][0]['errors'][0]['code'] ?? 'Unknown code';
-                    $errorDetails = $value['statuses'][0]['errors'][0]['error_data']['details'] ?? 'No additional details';
+                        if ($status === 'failed') {
+                            $errMsg = data_get($statusItem, 'errors.0.message', 'Unknown error');
+                            $errCode = data_get($statusItem, 'errors.0.code', 'Unknown code');
+                            $errDet = data_get($statusItem, 'errors.0.error_data.details', 'No additional details');
+                            Log::error("Webhook processing error: {$errMsg}, Code: {$errCode}, Details: {$errDet}");
+                            $wam->caption = (string) $errCode;
+                        }
 
-                    Log::error("Webhook processing error: {$errorMessage}, Code: {$errorCode}, Details: {$errorDetails}");
-
-                    // Save the error code in the caption field of the message, if the message exists
-                    if (!empty($wam->id)) {
-                        $wam->caption = $errorCode;
                         $wam->save();
                         Webhook::dispatch($wam, true);
                     }
                 }
 
-            } else if (!empty($value['messages'])) { // Check if there are messages to process
+                // C) Mensajes entrantes
+            } elseif (!empty(data_get($value, 'messages'))) {
+                $msg = data_get($value, 'messages.0', []);
+                $contacts0 = data_get($value, 'contacts.0', []);
+                $incomingId = data_get($msg, 'id');
+                $fromWaId = data_get($msg, 'from'); // remitente
+                $incomingTyp = data_get($msg, 'type'); // text|audio|image|...
+                $phoneId = data_get($value, 'metadata.phone_number_id');
+                $timestamp = data_get($msg, 'timestamp');
 
-                // Check if the contact exists
-                $contacto = Contacto::where('telefono', $value['contacts'][0]['wa_id'])->first();
+                // Idempotencia
+                if (Message::where('wam_id', $incomingId)->exists()) {
+                    return response()->json(['success' => true, 'data' => 'duplicate'], 200);
+                }
 
-                // Create new contact if it does not exist
-                if (!$contacto) {
-                    $contacto = new Contacto();
-                    $contacto->telefono = $value['contacts'][0]['wa_id'];
-                    $contacto->nombre = $value['contacts'][0]['profile']['name'];
-                    $contacto->notas = "Contacto creado por webhook";
-                    $contacto->save();
-
-                    // Attach selected tags to the new contact
-                    $contacto->tags()->attach(22);
-
-                } else if ($contacto->nombre == $contacto->telefono) {
-                    $contacto->nombre = $value['contacts'][0]['profile']['name'];
-                    $contacto->notas = "Nombre actualizado por webhook";
+                // Contacto
+                $waId = data_get($contacts0, 'wa_id', $fromWaId);
+                $nombre = data_get($contacts0, 'profile.name', $waId);
+                $contacto = Contacto::firstOrCreate(
+                    ['telefono' => $waId],
+                    ['nombre' => $nombre ?: $waId, 'notas' => 'Contacto creado automáticamente por webhook']
+                );
+                if ($contacto->nombre === $contacto->telefono && $nombre) {
+                    $contacto->nombre = $nombre;
+                    $contacto->notas = 'Nombre actualizado por webhook';
                     $contacto->save();
                 }
-                // Check if the message already exists
-                $exists = Message::where('wam_id', $value['messages'][0]['id'])->first();
-                if (empty($exists->id)) {
-                    $mediaSupported = ['audio', 'document', 'image', 'video', 'sticker'];
+                // Tag opcional (no revienta si no hay sesión)
+                try {
+                    $contacto->tags()->syncWithoutDetaching([22 => ['user_id' => auth()->id() ?? null]]);
+                } catch (\Throwable $e) {
+                    Log::warning('No se pudieron asociar tags: ' . $e->getMessage());
+                }
 
-                    // Process text messages
-                    if ($value['messages'][0]['type'] == 'text') {
-                        $message = $this->_saveMessage(
-                            $value['messages'][0]['text']['body'],
-                            'text',
-                            $value['messages'][0]['from'],
-                            $value['messages'][0]['id'],
-                            $value['metadata']['phone_number_id'],
-                            $value['messages'][0]['timestamp']
-                        );
+                // Contexto de app/bot/token (helper)
+                [$num, $app, $bot, $token] = $this->resolveAppContext($phoneId);
 
-                        // Recuperar o crear un hilo
-                        $userWaId = $value['contacts'][0]['wa_id'];
-                        $messageBody = $value['messages'][0]['text']['body'];
+                // Tipos soportados de media
+                $mediaSupported = ['audio', 'document', 'image', 'video', 'sticker'];
 
+                // 1) TEXTO
+                if ($incomingTyp === 'text') {
+                    $text = (string) data_get($msg, 'text.body', '');
 
+                    // Guardar entrante
+                    // Guardar entrante (texto) SIN marcar bandeja humana todavía
+                    $phoneForMsg = $num->id_telefono ?? $phoneId;
+                    $this->_saveMessage(
+                        $text,
+                        'text',
+                        $fromWaId,
+                        $incomingId,
+                        $phoneForMsg,
+                        $timestamp,
+                        null,   // caption
+                        '',     // data
+                        false,  // outgoing
+                        true,   // fireWebhook
+                        false   // markForHuman (lo decides después según haya bot)
+                    );
 
+                    if ($this->shouldAutoReply($app, $bot)) {
+                        try {
+                            $botIA = new BotIA();
+                            $answer = $botIA->ask($text, $waId, $bot->id, $bot->openai_key, $bot->openai_org, $bot->openai_assistant, "");
+                            $wh = new Whatsapp();
+                            $sent = $wh->sendText($waId, $answer, $num->id_telefono, $token);
 
-                        //enviar respuesta del bot al whatsapp
-                        $respuesta = new Whatsapp();
-                        $num = Numeros::where('id_telefono', $value['metadata']['phone_number_id'])->first();
-                        $app = Aplicaciones::where('id', $num->aplicacion_id)->first();
-
-                        // Verificar si existe la aplicación
-                        if ($app) {
-                            // Obtener el bot asociado a la aplicación
-                            $bot = $app->bot->first(); // Esto obtiene el primer bot asociado a la aplicación
-
-                            // Ahora tienes acceso a los datos del bot
-                            if ($bot) {
-                                $botIA = new BotIA();
-                                $answer = $botIA->ask($messageBody, $userWaId, $bot->id, $bot->openai_key, $bot->openai_org, $bot->openai_assistant, $imagenurl = "");
-                                // Otros datos del bot que necesites...
-                            } else {
-                                // Maneja el caso donde no hay un bot asociado
-                                echo "No hay un bot asociado a esta aplicación.";
-                            }
-
-                        } else {
-                            echo "No se encontró la aplicación.";
-                        }
-
-                        $tk = $app->token_api;
-                        $response = $respuesta->sendText($userWaId, $answer, $num->id_telefono, $app->token_api);
-
-                        $message = new Message();
-                        $message->wa_id = $value['contacts'][0]['wa_id'];
-                        $message->wam_id = $response["messages"][0]["id"];
-                        $message->phone_id = $num->id_telefono;
-                        $message->type = 'ia';
-                        $message->outgoing = true;
-                        $message->body = $answer;
-                        $message->status = 'sent';
-                        $message->caption = '';
-                        $message->data = '';
-                        $message->save();
-                        //Log::info('Mensaje de la ia: ' . $message->body);
-
-
-                        Webhook::dispatch($message, false);
-                    }
-                    // Process media messages
-                    else if (in_array($value['messages'][0]['type'], $mediaSupported)) {
-                        $mediaType = $value['messages'][0]['type'];
-                        $mediaId = $value['messages'][0][$mediaType]['id'];
-                        $wp = new Whatsapp();
-                        $num = Numeros::where('id_telefono', $value['metadata']['phone_number_id'])->first();
-                        $app = Aplicaciones::where('id', $num->aplicacion_id)->first();
-                        $tk = $app->token_api;
-                        $file = $wp->downloadMedia($mediaId, $tk);
-
-                        $caption = $value['messages'][0][$mediaType]['caption'] ?? null;
-
-                        if (!is_null($file)) {
-                            // Guardar el audio recibido con el link
-                            $audioMessage = new Message();
-                            $audioMessage->wa_id = $value['contacts'][0]['wa_id'];
-                            $audioMessage->wam_id = $value['messages'][0]['id'];
-                            $audioMessage->phone_id = $num->id_telefono;
-                            $audioMessage->type = $mediaType; // Puede ser audio, documento, imagen, etc.
-                            $audioMessage->outgoing = false;
-                            $audioMessage->body = env('APP_URL_MG') . '/storage/' . $file; // Guardar solo el enlace del archivo
-                            $audioMessage->status = 'received';
-                            $audioMessage->caption = $caption ?? '';
-                            $audioMessage->data = '';
-                            $audioMessage->save();
-
-                            Webhook::dispatch($audioMessage, false);
-                            // 🔥 Marcar contacto con mensaje nuevo
-                            $contacto->tiene_mensajes_nuevos = true;
-                            $contacto->save();
-
-                            if ($mediaType == 'audio') {
-                                $bot = $app->bot->first();
-                                config(['openai.api_key' => $bot->openai_key]);
-                                config(['openai.organization' => $bot->openai_org]);
-
-                                // Transcripción de audio con Whisper (solo para generar respuesta)
-                                $response = OpenAI::audio()->transcribe([
-                                    'model' => 'whisper-1',
-                                    'file' => fopen(storage_path('app/public/' . $file), 'r'),
-                                    'response_format' => 'verbose_json',
-                                    'timestamp_granularities' => ['segment', 'word']
-                                ]);
-
-                                $transcribedText = $response->text;
-
-                                // Procesar la transcripción con el bot
-                                $botIA = new BotIA();
-                                $answer = $botIA->ask($transcribedText, $value['messages'][0]['from'], $bot->id, $bot->openai_key, $bot->openai_org, $bot->openai_assistant, $imagenurl = "");
-
-                                // Enviar respuesta al usuario por WhatsApp
-                                $respuesta = new Whatsapp();
-                                $response = $respuesta->sendText($value['messages'][0]['from'], $answer, $num->id_telefono, $app->token_api);
-
-                                // Guardar solo el mensaje de respuesta
-                                $reply = new Message();
-                                $reply->wa_id = $value['contacts'][0]['wa_id'];
-                                $reply->wam_id = $response["messages"][0]["id"];
-                                $reply->phone_id = $num->id_telefono;
-                                $reply->type = 'text';
-                                $reply->outgoing = true;
-                                $reply->body = $answer;
-                                $reply->status = 'sent';
-                                $reply->caption = '';
-                                $reply->data = '';
-                                $reply->save();
-
-                                Webhook::dispatch($reply, false);
-                            }
-                            if ($mediaType == 'image') {
-
-                                Log::info('📸 Procesando imagen recibida en WhatsApp.');
-
-                                $bot = $app->bot->first();
-                                if (!$bot) {
-                                    Log::error('❌ No se encontró un bot asociado al app.');
-                                    return;
-                                }
-
-                                config(['openai.api_key' => $bot->openai_key]);
-                                config(['openai.organization' => $bot->openai_org]);
-
-                                //si $caption esta vacio o null
-                                $botIA = new BotIA();
-                                $imagenurl = env('APP_URL_MG') . '/storage/' . $file;
-
-                                Log::info('🌐 URL de la imagen generada: ' . $imagenurl);
-
-                                if (!file_exists(storage_path('app/public/' . $file))) {
-                                    Log::error('❌ La imagen no existe en el almacenamiento: ' . storage_path('app/public/' . $file));
-                                    return;
-                                }
-
-                                $waId = $value['messages'][0]['from'] ?? null;
-                                if (!$waId) {
-                                    Log::error('❌ No se encontró el identificador del remitente en WhatsApp.');
-                                    return;
-                                }
-
-                                if ($caption == null) {
-                                    Log::info('📝 No se encontró caption. Usando mensaje predeterminado.');
-                                    $caption = "Revisa la imagen y responde acorde a la charla";
-                                }
-
-                                // Enviar mensaje a OpenAI
-                                Log::info('💬 Enviando a OpenAI -> Caption: ' . $caption);
-
-                                try {
-                                    $answer = $botIA->ask($caption, $waId, $bot->id, $bot->openai_key, $bot->openai_org, $bot->openai_assistant, $imagenurl);
-                                    Log::info('✅ Respuesta de OpenAI: ' . $answer);
-                                } catch (Exception $e) {
-                                    Log::error('❌ Error al procesar con OpenAI: ' . $e->getMessage());
-                                    return;
-                                }
-
-                                // Enviar respuesta al usuario por WhatsApp
-                                $respuesta = new Whatsapp();
-
-                                try {
-                                    Log::info('📤 Enviando respuesta a WhatsApp...');
-                                    $response = $respuesta->sendText($waId, $answer, $num->id_telefono, $app->token_api);
-                                    Log::info('✅ Respuesta enviada con éxito. ID de mensaje: ' . $response["messages"][0]["id"]);
-                                } catch (Exception $e) {
-                                    Log::error('❌ Error al enviar respuesta a WhatsApp: ' . $e->getMessage());
-                                    return;
-                                }
-
-
-                                // Guardar solo el mensaje de respuesta en la base de datos
-                                try {
-                                    Log::info('💾 Guardando mensaje en la base de datos...');
-                                    $reply = new Message();
-                                    $reply->wa_id = $value['contacts'][0]['wa_id'];
-                                    $reply->wam_id = $response["messages"][0]["id"];
-                                    $reply->phone_id = $num->id_telefono;
-                                    $reply->type = 'text';
-                                    $reply->outgoing = true;
-                                    $reply->body = $answer;
-                                    $reply->status = 'sent';
-                                    $reply->caption = '';
-                                    $reply->data = '';
-                                    $reply->save();
-                                    Log::info('✅ Mensaje guardado exitosamente en la base de datos.');
-                                    Webhook::dispatch($reply, false);
-                                } catch (Exception $e) {
-                                    Log::error('❌ Error al guardar el mensaje en la base de datos: ' . $e->getMessage());
-                                    return;
-                                }
-
-                            }
-                        }
-                    }
-
-                    // Log and process other message types
-                    else {
-                        $type = $value['messages'][0]['type'];
-                        if (!empty($value['messages'][0][$type])) {
-                            $message = $this->_saveMessage(
-                                "($type): \n _" . serialize($value['messages'][0][$type]) . "_",
-                                'other',
-                                $value['messages'][0]['from'],
-                                $value['messages'][0]['id'],
-                                $value['metadata']['phone_number_id'],
-                                $value['messages'][0]['timestamp']
+                            // outgoing=true, fireWebhook=true, markForHuman=false
+                            $this->_saveMessage(
+                                $answer,
+                                'ia',
+                                $waId,
+                                data_get($sent, 'messages.0.id'),
+                                $num->id_telefono,
+                                null,          // timestamp (opcional)
+                                '',            // caption
+                                '',            // data
+                                true,          // outgoing
+                                true,          // fireWebhook
+                                false          // markForHuman
                             );
-                            Webhook::dispatch($message, false);
-                            // 🔥 Marcar contacto con mensaje nuevo
-                            $contacto->tiene_mensajes_nuevos = true;
-                            $contacto->save();
+
+                        } catch (\Throwable $e) {
+                            Log::error('IA (texto) falló: ' . $e->getMessage());
+                            $this->markForHuman($contacto);
+                        }
+                    } else {
+                        Log::info('No auto-reply (texto): app o bot inexistente.');
+                        $this->markForHuman($contacto);
+                    }
+                }
+                // 2) MEDIA
+                elseif (in_array($incomingTyp, $mediaSupported, true)) {
+                    $mediaId = data_get($msg, "{$incomingTyp}.id");
+                    $caption = data_get($msg, "{$incomingTyp}.caption");
+
+                    if (!$app || !$token) {
+                        Log::warning('Media recibida sin app/token. Se marca humano.');
+                        $this->_saveMessage(
+                            "($incomingTyp) sin app/token",
+                            'other',
+                            $fromWaId,
+                            $incomingId,
+                            $phoneId,
+                            $timestamp,
+                            null,
+                            '',
+                            false,
+                            true,
+                            false // ← para no marcar dos veces
+                        );
+                        $this->markForHuman($contacto);
+                    } else {
+                        $wp = new Whatsapp();
+                        $file = null;
+                        try {
+                            $file = $wp->downloadMedia($mediaId, $token);
+                        } catch (\Throwable $e) {
+                            Log::error('Error descargando media: ' . $e->getMessage());
+                        }
+
+                        if ($file) {
+                            // Guardar entrante como link
+                            $phoneForMsg = $num->id_telefono ?? $phoneId;
+                            $this->_saveMessage(
+                                env('APP_URL_MG') . '/storage/' . $file,
+                                $incomingTyp,
+                                $waId,
+                                $incomingId,
+                                $phoneForMsg,
+                                $timestamp,
+                                $caption ?? '',
+                                '',
+                                false,  // outgoing
+                                true,   // fireWebhook
+                                false   // markForHuman -> lo harás luego según corresponda
+                            );
+
+
+                            // AUDIO con IA
+                            if ($incomingTyp === 'audio') {
+                                if (!$this->shouldAutoReply($app, $bot)) {
+                                    Log::info('Audio sin bot. No auto-reply.');
+                                    $this->markForHuman($contacto);
+                                } else {
+                                    try {
+                                        config(['openai.api_key' => $bot->openai_key, 'openai.organization' => $bot->openai_org]);
+
+                                        $resp = OpenAI::audio()->transcribe([
+                                            'model' => 'whisper-1',
+                                            'file' => fopen(storage_path('app/public/' . $file), 'r'),
+                                            'response_format' => 'verbose_json',
+                                            'timestamp_granularities' => ['segment', 'word']
+                                        ]);
+                                        $text = (string) data_get($resp, 'text', '');
+
+                                        $botIA = new BotIA();
+                                        $answer = $botIA->ask($text, $fromWaId, $bot->id, $bot->openai_key, $bot->openai_org, $bot->openai_assistant, "");
+                                        $wh = new Whatsapp();
+                                        $sent = $wh->sendText($fromWaId, $answer, $num->id_telefono, $token);
+
+                                        // outgoing=true, fireWebhook=true, markForHuman=false
+                                        $this->_saveMessage(
+                                            $answer,
+                                            'ia',
+                                            $waId,
+                                            data_get($sent, 'messages.0.id'),
+                                            $num->id_telefono,
+                                            null,
+                                            '',
+                                            '',
+                                            true,
+                                            true,
+                                            false
+                                        );
+                                    } catch (\Throwable $e) {
+                                        Log::error('IA (audio) falló: ' . $e->getMessage());
+                                        $this->markForHuman($contacto);
+                                    }
+                                }
+                            }
+
+                            // IMAGEN con IA
+                            if ($incomingTyp === 'image') {
+                                if (!$this->shouldAutoReply($app, $bot)) {
+                                    Log::info('Imagen sin bot. No auto-reply.');
+                                    $this->markForHuman($contacto);
+                                } else {
+                                    try {
+                                        config(['openai.api_key' => $bot->openai_key, 'openai.organization' => $bot->openai_org]);
+
+                                        $imgUrl = env('APP_URL_MG') . '/storage/' . $file;
+                                        if (!file_exists(storage_path('app/public/' . $file))) {
+                                            Log::error('La imagen no existe en storage: ' . storage_path('app/public/' . $file));
+                                        } else {
+                                            $finalCaption = $caption ?: 'Revisa la imagen y responde acorde a la charla';
+                                            $botIA = new BotIA();
+                                            $answer = $botIA->ask($finalCaption, $fromWaId, $bot->id, $bot->openai_key, $bot->openai_org, $bot->openai_assistant, $imgUrl);
+
+                                            $wh = new Whatsapp();
+                                            $sent = $wh->sendText($fromWaId, $answer, $num->id_telefono, $token);
+
+                                            // outgoing=true, fireWebhook=true, markForHuman=false
+                                            $this->_saveMessage(
+                                                $answer,
+                                                'ia',
+                                                $waId,
+                                                data_get($sent, 'messages.0.id'),
+                                                $num->id_telefono,
+                                                null,
+                                                '',
+                                                '',
+                                                true,
+                                                true,
+                                                false
+                                            );
+                                        }
+                                    } catch (\Throwable $e) {
+                                        Log::error('IA (imagen) falló: ' . $e->getMessage());
+                                        $this->markForHuman($contacto);
+                                    }
+                                }
+                            }
+
+                            // Otros media → por defecto humano
+                            if (!in_array($incomingTyp, ['audio', 'image'], true)) {
+                                $this->markForHuman($contacto);
+                            }
+                        } else {
+                            // No descargó
+                            $this->_saveMessage("($incomingTyp) no descargado", 'other', $fromWaId, $incomingId, $phoneId, $timestamp);
+                            $this->markForHuman($contacto);
                         }
                     }
+                }
+                // 3) Tipo no soportado
+                else {
+                    $payloadSafe = substr(json_encode($msg), 0, 2000);
+                    $this->_saveMessage(
+                        "(unsupported {$incomingTyp}): \n _{$payloadSafe}_",
+                        'other',
+                        $fromWaId,
+                        $incomingId,
+                        $phoneId,
+                        $timestamp,
+                        null,
+                        '',
+                        false,
+                        true,
+                        false // si luego llamas markForHuman($contacto)
+                    );
+                    $this->markForHuman($contacto);
                 }
             }
 
-            // Return a success response if the process completes
-            return response()->json([
-                'success' => true,
-                'data' => '',
-            ], 200);
-        } catch (Exception $e) {
-            // Log the error details and trace for debugging purposes
-            Log::error('Error al obtener mensajes6: ' . $e->getMessage());
-            Log::error('Exception trace: ' . $e->getTraceAsString());
-            Log::error('Contenido del cuerpo de la solicitud con error: ' . $request->getContent());
+            // D) Siempre 200
+            return response()->json(['success' => true, 'data' => 'ok'], 200);
 
-            // Return an error response with the exception message
-            return response()->json([
-                'success' => false,
-                'error' => $e->getMessage(),
-            ], 500);
+        } catch (\Throwable $e) {
+            Log::error('Error al procesar webhook: ' . $e->getMessage());
+            Log::error('Trace: ' . $e->getTraceAsString());
+            Log::error('Body: ' . $request->getContent());
+            // Evita reintentos masivos de Meta
+            return response()->json(['success' => true, 'data' => 'handled_with_errors'], 200);
+        }
+    }
+
+    /* ===================== HELPERS ===================== */
+
+    /**
+     * Resuelve Numeros, Aplicaciones, Bot y token api desde phoneNumberId.
+     * @return array [$num, $app, $bot, $token]
+     */
+    private function resolveAppContext($phoneNumberId)
+    {
+        if (!$phoneNumberId)
+            return [null, null, null, null];
+
+        $num = Numeros::where('id_telefono', $phoneNumberId)->first();
+        if (!$num)
+            return [null, null, null, null];
+
+        $app = Aplicaciones::find($num->aplicacion_id);
+        if (!$app)
+            return [$num, null, null, null];
+
+        $bot = $app->bot->first();
+        $tk = $app->token_api ?? null;
+
+        return [$num, $app, $bot, $tk];
+    }
+
+    /**
+     * Define si se debe contestar automáticamente.
+     */
+    private function shouldAutoReply($app, $bot): bool
+    {
+        return !is_null($app) && !is_null($bot);
+    }
+
+    /**
+     * Marca contacto para gestión humana (inbox).
+     */
+    private function markForHuman(?Contacto $contacto): void
+    {
+        if (!$contacto)
+            return;
+        try {
+            $contacto->tiene_mensajes_nuevos = true;
+            $contacto->save();
+        } catch (\Throwable $e) {
+            Log::warning('No se pudo marcar para humano: ' . $e->getMessage());
         }
     }
 
 
 
-    private function _saveMessage($message, $messageType, $waId, $wamId, $phoneId, $timestamp = null, $caption = null, $data = '')
-    {
+
+    private function _saveMessage(
+        $message,
+        $messageType,
+        $waId,
+        $wamId,
+        $phoneId,
+        $timestamp = null,
+        $caption = null,
+        $data = '',
+        bool $outgoing = false,          // NUEVO: por defecto es entrante
+        bool $fireWebhook = true,        // NUEVO: disparar evento
+        bool $markForHuman = true        // NUEVO: marcar bandeja humana solo si es entrante
+    ) {
         $wam = new Message();
-        $wam->body = $message;
-        $wam->outgoing = false;
+        $wam->body = (string) $message;
+        $wam->outgoing = $outgoing;
         $wam->type = $messageType;
         $wam->wa_id = $waId;
         $wam->wam_id = $wamId;
         $wam->phone_id = $phoneId;
-        $wam->status = 'sent';
-        $wam->caption = $caption;
-        $wam->data = $data;
 
-        if (!is_null($timestamp)) {
-            $wam->created_at = Carbon::createFromTimestamp($timestamp)->toDateTimeString();
-            $wam->updated_at = Carbon::createFromTimestamp($timestamp)->toDateTimeString();
+        // Status coherente con la dirección del mensaje
+        $wam->status = $outgoing ? 'sent' : 'received';
+
+        $wam->caption = $caption ?? '';
+        $wam->data = $data ?? '';
+
+        // Normalizar timestamp (WhatsApp suele enviar en segundos; por si llega en ms)
+        if (is_numeric($timestamp)) {
+            $ts = (int) $timestamp;
+            // Si parece milisegundos (>= 13 dígitos), convertir a segundos
+            if (strlen((string) $ts) >= 13) {
+                $ts = intdiv($ts, 1000);
+            }
+            try {
+                $dt = \Carbon\Carbon::createFromTimestampUTC($ts); // UTC safe
+                $wam->created_at = $dt->toDateTimeString();
+                $wam->updated_at = $dt->toDateTimeString();
+            } catch (\Throwable $e) {
+                \Log::warning('Timestamp inválido en _saveMessage: ' . $e->getMessage());
+            }
         }
-        $wam->save();
 
-        Webhook::dispatch($wam, false);
-        Log::info('mensaje enviado por el usuario: ' . $wam->body);
-        // encontrar el contacto relacionado
-        $contacto = Contacto::where('telefono', $waId)->first();
-        // 🔥 Marcar contacto con mensaje nuevo
-        $contacto->tiene_mensajes_nuevos = true;
-        $contacto->save();
+        // Guardar con manejo básico de duplicados por wam_id (si tienes índice único)
+        try {
+            $wam->save();
+        } catch (\Throwable $e) {
+            \Log::error('Error guardando Message (posible wam_id duplicado): ' . $e->getMessage());
+            // Intentar recuperar el existente para no romper el flujo
+            $wam = Message::where('wam_id', $wamId)->first() ?? $wam;
+        }
+
+        // Disparar webhook (si corresponde)
+        if ($fireWebhook) {
+            try {
+                Webhook::dispatch($wam, $outgoing /* isStatus? -> aquí false para mensajes, true lo usas en estatus */);
+            } catch (\Throwable $e) {
+                \Log::warning('No se pudo despachar Webhook en _saveMessage: ' . $e->getMessage());
+            }
+        }
+
+        // Log breve (evita exponer datos sensibles)
+        \Log::info(sprintf(
+            'Mensaje %s guardado: type=%s wam_id=%s len=%d',
+            $outgoing ? 'saliente' : 'entrante',
+            $messageType,
+            $wamId,
+            mb_strlen((string) $message)
+        ));
+
+        // Marcar contacto para gestión humana SOLO si es entrante y así se solicita
+        if (!$outgoing && $markForHuman) {
+            try {
+                $contacto = Contacto::where('telefono', $waId)->first();
+                if ($contacto) {
+                    $contacto->tiene_mensajes_nuevos = true;
+                    $contacto->save();
+                }
+            } catch (\Throwable $e) {
+                \Log::warning('No se pudo marcar contacto con mensajes nuevos: ' . $e->getMessage());
+            }
+        }
 
         return $wam;
     }
+
 
 
 }
